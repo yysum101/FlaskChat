@@ -15,7 +15,6 @@ DATABASE_URL = os.environ.get("DATABASE_URL")
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL environment variable NOT set")
 
-# Fix postgres:// to postgresql:// if needed
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
@@ -501,5 +500,4 @@ def chat():
 if __name__ == "__main__":
     with app.app_context():
         db.create_all()
-    # For Render, gunicorn will start the app, so debug=False here
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=False)
