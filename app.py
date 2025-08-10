@@ -1,308 +1,510 @@
-import os
-import urllib.parse as up
-from datetime import datetime
-from flask import Flask, request, redirect, url_for, session, flash, render_template_string
-from werkzeug.security import generate_password_hash, check_password_hash
+from flask import (
+    Flask, render_template_string, request, redirect, url_for, session, flash, abort
+)
 from flask_sqlalchemy import SQLAlchemy
+from werkzeug.security import generate_password_hash, check_password_hash
+from urllib import parse as up
+import os
 
 app = Flask(__name__)
-app.secret_key = os.getenv("SECRET_KEY", "supersecretkey")
+app.secret_key = os.environ.get("SECRET_KEY", "dev_secret_key")
 
-# Configure database: use DATABASE_URL env variable on Render, else SQLite locally
-DATABASE_URL = os.getenv("DATABASE_URL")
-if DATABASE_URL:
-    up.uses_netloc.append("postgres")
-    url = up.urlparse(DATABASE_URL)
-    app.config["SQLALCHEMY_DATABASE_URI"] = f"postgresql://{url.username}:{url.password}@{url.hostname}:{url.port}{url.path}"
-else:
-    app.config["SQLALCHEMY_DATABASE_URI"] = "sqlite:///local.db"
+# Parse DATABASE_URL env var for PostgreSQL connection, handle missing port
+DATABASE_URL = os.environ.get("DATABASE_URL")
+if not DATABASE_URL:
+    raise RuntimeError("DATABASE_URL environment variable NOT set")
 
+up.uses_netloc.append("postgres")
+url = up.urlparse(DATABASE_URL)
+port = url.port or 5432  # Default postgres port if missing
+app.config[
+    "SQLALCHEMY_DATABASE_URI"
+] = f"postgresql://{url.username}:{url.password}@{url.hostname}:{port}{url.path}"
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
+
 db = SQLAlchemy(app)
 
 # Models
 class User(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     username = db.Column(db.String(80), unique=True, nullable=False)
-    password = db.Column(db.String(200), nullable=False)
-    about = db.Column(db.String(500))
+    password_hash = db.Column(db.String(128), nullable=False)
+    about = db.Column(db.String(300), default="")
     posts = db.relationship("Post", backref="author", lazy=True)
-    messages = db.relationship("Message", backref="sender", lazy=True)
+    messages = db.relationship("Message", backref="author", lazy=True)
+
+    def set_password(self, pw):
+        self.password_hash = generate_password_hash(pw)
+
+    def check_password(self, pw):
+        return check_password_hash(self.password_hash, pw)
+
 
 class Post(db.Model):
     id = db.Column(db.Integer, primary_key=True)
-    subject = db.Column(db.String(200), nullable=False)
+    subject = db.Column(db.String(150), nullable=False)
     body = db.Column(db.Text, nullable=False)
-    timestamp = db.Column(db.DateTime, default=datetime.utcnow)
     user_id = db.Column(db.Integer, db.ForeignKey("user.id"), nullable=False)
+
 
 class Message(db.Model):
     id = db.Column(db.Integer, primary_key=True)
-    text = db.Column(db.String(500), nullable=False)
-    timestamp = db.Column(db.DateTime, default=datetime.utcnow)
+    content = db.Column(db.Text, nullable=False)
     user_id = db.Column(db.Integer, db.ForeignKey("user.id"), nullable=False)
 
-with app.app_context():
-    db.create_all()
 
-# Base HTML template with Bootstrap and style
-BASE_HTML = """
-<!DOCTYPE html>
-<html lang="en">
+# Helpers
+def current_user():
+    uid = session.get("user_id")
+    if uid:
+        return User.query.get(uid)
+    return None
+
+
+def login_required(f):
+    from functools import wraps
+
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        if not current_user():
+            flash("Please log in first.", "warning")
+            return redirect(url_for("login"))
+        return f(*args, **kwargs)
+
+    return decorated
+
+
+# Templates (using render_template_string for single-file app)
+base_template = """
+<!doctype html>
+<html lang="en" data-bs-theme="light">
 <head>
-<meta charset="UTF-8" />
-<title>{{ title }}</title>
-<link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet" />
-<style>
-body {
-  background: linear-gradient(135deg, #a2d2ff, #b9fbc0);
-  min-height: 100vh;
-}
-.card {
-  border-radius: 15px;
-  box-shadow: 0px 4px 15px rgba(0,0,0,0.1);
-}
-.navbar-brand {
-  font-weight: 700;
-}
-.chat-bubble {
-  padding: 10px 15px;
-  border-radius: 15px;
-  margin-bottom: 5px;
-  max-width: 70%;
-  word-wrap: break-word;
-}
-.chat-right {
-  background-color: #a2d2ff;
-  align-self: flex-end;
-  text-align: right;
-}
-.chat-left {
-  background-color: #b9fbc0;
-  align-self: flex-start;
-}
-.chat-container {
-  height: 300px;
-  overflow-y: auto;
-  display: flex;
-  flex-direction: column;
-  gap: 5px;
-  padding: 10px;
-  background: #d0f0e0;
-  border-radius: 15px;
-}
-</style>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>{{ title or 'FriendBook' }}</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet" />
+    <style>
+        body {
+            background: #d0f0f7;
+            color: #003300;
+        }
+        .card {
+            border-radius: 0.75rem;
+            box-shadow: 0 4px 8px rgba(20, 120, 100, 0.15);
+        }
+        .navbar, .footer {
+            background: #a0d8b3;
+        }
+        .btn-primary {
+            background-color: #339966;
+            border-color: #2d7a4b;
+        }
+        .btn-primary:hover {
+            background-color: #2d7a4b;
+            border-color: #255f3a;
+        }
+        .chat-message {
+            max-width: 70%;
+            padding: 10px 15px;
+            margin-bottom: 8px;
+            border-radius: 15px;
+            word-wrap: break-word;
+        }
+        .chat-message.user {
+            background-color: #339966;
+            color: white;
+            margin-left: auto;
+            border-bottom-right-radius: 0;
+        }
+        .chat-message.other {
+            background-color: #d0f0f7;
+            color: #003300;
+            margin-right: auto;
+            border-bottom-left-radius: 0;
+        }
+        .flash-message {
+            margin-top: 10px;
+        }
+        a.nav-link.active {
+            font-weight: 600;
+            color: #004d26 !important;
+        }
+    </style>
 </head>
 <body>
-<nav class="navbar navbar-expand-lg navbar-dark bg-primary">
-  <div class="container-fluid">
-    <a class="navbar-brand" href="{{ url_for('dashboard') }}">FriendBook</a>
-    <div class="collapse navbar-collapse">
+<nav class="navbar navbar-expand-lg navbar-light mb-4">
+  <div class="container">
+    <a class="navbar-brand fw-bold text-dark" href="{{ url_for('dashboard') }}">FriendBook</a>
+    <button class="navbar-toggler" type="button" data-bs-toggle="collapse" data-bs-target="#navMenu" aria-controls="navMenu" aria-expanded="false" aria-label="Toggle navigation">
+      <span class="navbar-toggler-icon"></span>
+    </button>
+    <div class="collapse navbar-collapse" id="navMenu">
       <ul class="navbar-nav ms-auto">
-        {% if session.get('user_id') %}
-        <li class="nav-item"><a class="nav-link" href="{{ url_for('dashboard') }}">Dashboard</a></li>
-        <li class="nav-item"><a class="nav-link" href="{{ url_for('chat') }}">Chat</a></li>
-        <li class="nav-item"><a class="nav-link" href="{{ url_for('profile', user_id=session['user_id']) }}">Profile</a></li>
-        <li class="nav-item"><a class="nav-link" href="{{ url_for('settings') }}">Settings</a></li>
-        <li class="nav-item"><a class="nav-link" href="{{ url_for('logout') }}">Logout</a></li>
+        {% if current_user %}
+          <li class="nav-item"><a class="nav-link {% if request.endpoint == 'dashboard' %}active{% endif %}" href="{{ url_for('dashboard') }}">Dashboard</a></li>
+          <li class="nav-item"><a class="nav-link {% if request.endpoint == 'chat' %}active{% endif %}" href="{{ url_for('chat') }}">Chat</a></li>
+          <li class="nav-item"><a class="nav-link {% if request.endpoint == 'profile' %}active{% endif %}" href="{{ url_for('profile') }}">Profile</a></li>
+          <li class="nav-item"><a class="nav-link {% if request.endpoint == 'settings' %}active{% endif %}" href="{{ url_for('settings') }}">Settings</a></li>
+          <li class="nav-item"><a class="nav-link" href="{{ url_for('logout') }}">Logout</a></li>
         {% else %}
-        <li class="nav-item"><a class="nav-link" href="{{ url_for('login') }}">Login</a></li>
-        <li class="nav-item"><a class="nav-link" href="{{ url_for('register') }}">Register</a></li>
+          <li class="nav-item"><a class="nav-link {% if request.endpoint == 'login' %}active{% endif %}" href="{{ url_for('login') }}">Login</a></li>
+          <li class="nav-item"><a class="nav-link {% if request.endpoint == 'register' %}active{% endif %}" href="{{ url_for('register') }}">Register</a></li>
         {% endif %}
       </ul>
     </div>
   </div>
 </nav>
-<div class="container my-4">
-{% with messages = get_flashed_messages() %}
-  {% if messages %}
-    {% for msg in messages %}
-      <div class="alert alert-info">{{ msg }}</div>
-    {% endfor %}
-  {% endif %}
-{% endwith %}
-{{ content|safe }}
+
+<div class="container">
+  {% with messages = get_flashed_messages(with_categories=true) %}
+    {% if messages %}
+      <div class="flash-message">
+      {% for category, message in messages %}
+        <div class="alert alert-{{ category }} alert-dismissible fade show" role="alert">
+          {{ message }}
+          <button type="button" class="btn-close" data-bs-dismiss="alert" aria-label="Close"></button>
+        </div>
+      {% endfor %}
+      </div>
+    {% endif %}
+  {% endwith %}
+  {% block content %}{% endblock %}
 </div>
+
+<footer class="footer text-center py-3 mt-5">
+  <small>FriendBook &copy; 2025</small>
+</footer>
+
+<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
 </body>
 </html>
 """
 
-# Routes
+# ROUTES
 
 @app.route("/")
 def home():
-    if "user_id" in session:
+    if current_user():
         return redirect(url_for("dashboard"))
-    return redirect(url_for("login"))
+    else:
+        return redirect(url_for("login"))
+
 
 @app.route("/register", methods=["GET", "POST"])
 def register():
+    if current_user():
+        return redirect(url_for("dashboard"))
     if request.method == "POST":
-        username = request.form["username"].strip()
-        password = request.form["password"]
-        confirm = request.form["confirm"]
-        about = request.form["about"].strip()
+        username = request.form.get("username", "").strip()
+        password = request.form.get("password", "")
+        confirm = request.form.get("confirm_password", "")
+        about = request.form.get("about", "").strip()
+
+        if not username or not password or not confirm:
+            flash("Please fill in all required fields.", "warning")
+            return redirect(url_for("register"))
+
         if password != confirm:
-            flash("Passwords do not match!")
+            flash("Passwords do not match.", "danger")
             return redirect(url_for("register"))
+
         if User.query.filter_by(username=username).first():
-            flash("Username already taken!")
+            flash("Username already taken.", "danger")
             return redirect(url_for("register"))
-        hashed = generate_password_hash(password)
-        user = User(username=username, password=hashed, about=about)
+
+        user = User(username=username, about=about)
+        user.set_password(password)
         db.session.add(user)
         db.session.commit()
-        flash("Registered successfully. Please login.")
+        flash("Registration successful. Please log in.", "success")
         return redirect(url_for("login"))
-    content = """
-    <div class="card p-4 mx-auto" style="max-width:400px;">
-    <h3 class="mb-3">Register</h3>
-    <form method="POST" novalidate>
-      <input class="form-control mb-2" name="username" placeholder="Username" required>
-      <input class="form-control mb-2" type="password" name="password" placeholder="Password" required>
-      <input class="form-control mb-2" type="password" name="confirm" placeholder="Confirm Password" required>
-      <textarea class="form-control mb-2" name="about" placeholder="Tell us more about yourself"></textarea>
-      <button class="btn btn-success w-100">Register</button>
-    </form>
-    </div>
-    """
-    return render_template_string(BASE_HTML, title="Register", content=content)
+
+    return render_template_string(
+        "{% extends base_template %}{% block content %}"
+        """
+        <div class="card p-4 mx-auto" style="max-width: 450px;">
+          <h3 class="mb-3">Register</h3>
+          <form method="POST" novalidate>
+            <div class="mb-3">
+              <label for="username" class="form-label">Username *</label>
+              <input type="text" class="form-control" id="username" name="username" required minlength="3" maxlength="80" />
+            </div>
+            <div class="mb-3">
+              <label for="about" class="form-label">Tell us more about yourself</label>
+              <textarea class="form-control" id="about" name="about" rows="2" maxlength="300"></textarea>
+            </div>
+            <div class="mb-3">
+              <label for="password" class="form-label">Password *</label>
+              <input type="password" class="form-control" id="password" name="password" required minlength="6" />
+            </div>
+            <div class="mb-3">
+              <label for="confirm_password" class="form-label">Confirm Password *</label>
+              <input type="password" class="form-control" id="confirm_password" name="confirm_password" required minlength="6" />
+            </div>
+            <button type="submit" class="btn btn-primary w-100">Register</button>
+          </form>
+          <p class="mt-3 mb-0 text-center">Already have an account? <a href="{{ url_for('login') }}">Login here</a>.</p>
+        </div>
+        """
+        + "{% endblock %}",
+        base_template=base_template,
+        title="Register",
+    )
+
 
 @app.route("/login", methods=["GET", "POST"])
 def login():
+    if current_user():
+        return redirect(url_for("dashboard"))
+
     if request.method == "POST":
-        username = request.form["username"].strip()
-        password = request.form["password"]
+        username = request.form.get("username", "").strip()
+        password = request.form.get("password", "")
+
         user = User.query.filter_by(username=username).first()
-        if user and check_password_hash(user.password, password):
-            session["user_id"] = user.id
-            flash("Welcome back, " + user.username + "!")
-            return redirect(url_for("dashboard"))
-        flash("Invalid username or password.")
-    content = """
-    <div class="card p-4 mx-auto" style="max-width:400px;">
-    <h3 class="mb-3">Login</h3>
-    <form method="POST" novalidate>
-      <input class="form-control mb-2" name="username" placeholder="Username" required>
-      <input class="form-control mb-2" type="password" name="password" placeholder="Password" required>
-      <button class="btn btn-primary w-100">Login</button>
-    </form>
-    </div>
-    """
-    return render_template_string(BASE_HTML, title="Login", content=content)
+        if not user or not user.check_password(password):
+            flash("Invalid username or password.", "danger")
+            return redirect(url_for("login"))
+
+        session["user_id"] = user.id
+        flash("Logged in successfully!", "success")
+        return redirect(url_for("dashboard"))
+
+    return render_template_string(
+        "{% extends base_template %}{% block content %}"
+        """
+        <div class="card p-4 mx-auto" style="max-width: 400px;">
+          <h3 class="mb-3">Login</h3>
+          <form method="POST" novalidate>
+            <div class="mb-3">
+              <label for="username" class="form-label">Username</label>
+              <input type="text" class="form-control" id="username" name="username" required minlength="3" maxlength="80" />
+            </div>
+            <div class="mb-3">
+              <label for="password" class="form-label">Password</label>
+              <input type="password" class="form-control" id="password" name="password" required minlength="6" />
+            </div>
+            <button type="submit" class="btn btn-primary w-100">Login</button>
+          </form>
+          <p class="mt-3 mb-0 text-center">Don't have an account? <a href="{{ url_for('register') }}">Register here</a>.</p>
+        </div>
+        """
+        + "{% endblock %}",
+        base_template=base_template,
+        title="Login",
+    )
+
 
 @app.route("/logout")
+@login_required
 def logout():
-    session.clear()
-    flash("Logged out successfully.")
+    session.pop("user_id", None)
+    flash("You have been logged out.", "info")
     return redirect(url_for("login"))
 
+
 @app.route("/dashboard", methods=["GET", "POST"])
+@login_required
 def dashboard():
-    if "user_id" not in session:
-        return redirect(url_for("login"))
+    user = current_user()
+
     if request.method == "POST":
-        subject = request.form["subject"].strip()
-        body = request.form["body"].strip()
-        if subject and body:
-            post = Post(subject=subject, body=body, user_id=session["user_id"])
+        subject = request.form.get("subject", "").strip()
+        body = request.form.get("body", "").strip()
+        if not subject or not body:
+            flash("Subject and body cannot be empty.", "warning")
+        else:
+            post = Post(subject=subject, body=body, author=user)
             db.session.add(post)
             db.session.commit()
-            flash("Post created!")
-        else:
-            flash("Subject and body cannot be empty.")
-    posts = Post.query.order_by(Post.timestamp.desc()).all()
-    content = """
-    <div class="card p-4 mb-4">
-      <h4>Create a Post</h4>
-      <form method="POST" novalidate>
-        <input class="form-control mb-2" name="subject" placeholder="Subject" required>
-        <textarea class="form-control mb-2" name="body" placeholder="Body" rows="4" required></textarea>
-        <button class="btn btn-success">Post</button>
-      </form>
-    </div>
-    {% for post in posts %}
-    <div class="card p-3 mb-3">
-      <h5>{{ post.subject }}</h5>
-      <p>{{ post.body }}</p>
-      <small class="text-muted">By {{ post.author.username }} on {{ post.timestamp.strftime('%Y-%m-%d %H:%M') }}</small>
-    </div>
-    {% endfor %}
-    """
-    return render_template_string(BASE_HTML, title="Dashboard", content=render_template_string(content, posts=posts))
+            flash("Post created successfully!", "success")
+            return redirect(url_for("dashboard"))
 
-@app.route("/chat", methods=["GET", "POST"])
-def chat():
-    if "user_id" not in session:
-        return redirect(url_for("login"))
-    if request.method == "POST":
-        text = request.form["text"].strip()
-        if text:
-            msg = Message(text=text, user_id=session["user_id"])
-            db.session.add(msg)
-            db.session.commit()
-    messages = Message.query.order_by(Message.timestamp.asc()).all()
-    content = """
-    <div class="chat-container">
-    {% for msg in messages %}
-      <div class="chat-bubble {% if msg.user_id == session['user_id'] %}chat-right{% else %}chat-left{% endif %}">
-        <strong>{{ msg.sender.username }}</strong><br>{{ msg.text }}
-      </div>
-    {% endfor %}
-    </div>
-    <form method="POST" class="mt-3 d-flex" novalidate>
-      <input class="form-control me-2" name="text" placeholder="Type a message..." autocomplete="off" required>
-      <button class="btn btn-primary">Send</button>
-    </form>
-    """
-    return render_template_string(BASE_HTML, title="Chat", content=render_template_string(content, messages=messages))
+    posts = Post.query.order_by(Post.id.desc()).all()
 
-@app.route("/profile/<int:user_id>")
-def profile(user_id):
-    if "user_id" not in session:
-        return redirect(url_for("login"))
-    user = User.query.get_or_404(user_id)
-    content = f"""
-    <div class="card p-4">
-      <h3>{user.username}</h3>
-      <p>{user.about or "No information provided."}</p>
-    </div>
-    """
-    return render_template_string(BASE_HTML, title="Profile", content=content)
+    return render_template_string(
+        "{% extends base_template %}{% block content %}"
+        """
+        <div class="row">
+          <div class="col-md-6 mx-auto">
+            <div class="card p-4 mb-4">
+              <h4>Create Post</h4>
+              <form method="POST" novalidate>
+                <div class="mb-3">
+                  <input type="text" class="form-control" name="subject" placeholder="Subject" maxlength="150" required />
+                </div>
+                <div class="mb-3">
+                  <textarea class="form-control" name="body" placeholder="Write your post here..." rows="4" required maxlength="2000"></textarea>
+                </div>
+                <button class="btn btn-primary w-100" type="submit">Post</button>
+              </form>
+            </div>
+
+            <h4 class="mb-3">Recent Posts</h4>
+            {% for post in posts %}
+              <div class="card p-3 mb-3">
+                <h5>{{ post.subject }}</h5>
+                <p>{{ post.body }}</p>
+                <small class="text-muted">By {{ post.author.username }}</small>
+              </div>
+            {% else %}
+              <p>No posts yet.</p>
+            {% endfor %}
+          </div>
+        </div>
+        """
+        + "{% endblock %}",
+        base_template=base_template,
+        title="Dashboard",
+        posts=posts,
+    )
+
+
+@app.route("/profile")
+@login_required
+def profile():
+    user = current_user()
+    return render_template_string(
+        "{% extends base_template %}{% block content %}"
+        """
+        <div class="card mx-auto" style="max-width: 450px; padding: 20px;">
+          <h3>Profile</h3>
+          <p><strong>Username:</strong> {{ user.username }}</p>
+          <p><strong>About Me:</strong> {{ user.about or "No information provided." }}</p>
+        </div>
+        """
+        + "{% endblock %}",
+        base_template=base_template,
+        title="Profile",
+        user=user,
+    )
+
 
 @app.route("/settings", methods=["GET", "POST"])
+@login_required
 def settings():
-    if "user_id" not in session:
-        return redirect(url_for("login"))
-    user = User.query.get(session["user_id"])
-    if request.method == "POST":
-        new_username = request.form["username"].strip()
-        new_about = request.form["about"].strip()
-        new_password = request.form["password"]
-        if new_username:
-            # Check if username already taken (except by this user)
-            if User.query.filter(User.username==new_username, User.id != user.id).first():
-                flash("Username already taken!")
-                return redirect(url_for("settings"))
-            user.username = new_username
-        user.about = new_about
-        if new_password:
-            user.password = generate_password_hash(new_password)
-        db.session.commit()
-        flash("Settings updated!")
-        return redirect(url_for("profile", user_id=user.id))
-    content = f"""
-    <div class="card p-4 mx-auto" style="max-width:500px;">
-    <h3>Settings</h3>
-    <form method="POST" novalidate>
-      <input class="form-control mb-2" name="username" placeholder="Username" value="{user.username}" required>
-      <textarea class="form-control mb-2" name="about" placeholder="About">{user.about or ''}</textarea>
-      <input class="form-control mb-2" type="password" name="password" placeholder="New Password (leave blank to keep current)">
-      <button class="btn btn-warning w-100">Save</button>
-    </form>
-    </div>
-    """
-    return render_template_string(BASE_HTML, title="Settings", content=content)
+    user = current_user()
 
+    if request.method == "POST":
+        new_username = request.form.get("username", "").strip()
+        about = request.form.get("about", "").strip()
+        current_password = request.form.get("current_password", "")
+        new_password = request.form.get("new_password", "")
+        confirm_new_password = request.form.get("confirm_new_password", "")
+
+        if new_username and new_username != user.username:
+            if User.query.filter_by(username=new_username).first():
+                flash("Username already taken.", "danger")
+                return redirect(url_for("settings"))
+            else:
+                user.username = new_username
+
+        user.about = about
+
+        if current_password or new_password or confirm_new_password:
+            if not current_password:
+                flash("Please enter your current password to change password.", "warning")
+                return redirect(url_for("settings"))
+            if not user.check_password(current_password):
+                flash("Current password is incorrect.", "danger")
+                return redirect(url_for("settings"))
+            if new_password != confirm_new_password:
+                flash("New passwords do not match.", "danger")
+                return redirect(url_for("settings"))
+            if len(new_password) < 6:
+                flash("New password must be at least 6 characters.", "warning")
+                return redirect(url_for("settings"))
+            user.set_password(new_password)
+
+        db.session.commit()
+        flash("Settings updated successfully.", "success")
+        return redirect(url_for("settings"))
+
+    return render_template_string(
+        "{% extends base_template %}{% block content %}"
+        """
+        <div class="card mx-auto" style="max-width: 450px; padding: 20px;">
+          <h3>Settings</h3>
+          <form method="POST" novalidate>
+            <div class="mb-3">
+              <label for="username" class="form-label">Change Username</label>
+              <input type="text" class="form-control" id="username" name="username" value="{{ user.username }}" minlength="3" maxlength="80" />
+            </div>
+            <div class="mb-3">
+              <label for="about" class="form-label">About Me</label>
+              <textarea class="form-control" id="about" name="about" rows="3" maxlength="300">{{ user.about }}</textarea>
+            </div>
+            <hr />
+            <h5>Change Password</h5>
+            <div class="mb-3">
+              <label for="current_password" class="form-label">Current Password</label>
+              <input type="password" class="form-control" id="current_password" name="current_password" />
+            </div>
+            <div class="mb-3">
+              <label for="new_password" class="form-label">New Password</label>
+              <input type="password" class="form-control" id="new_password" name="new_password" minlength="6" />
+            </div>
+            <div class="mb-3">
+              <label for="confirm_new_password" class="form-label">Confirm New Password</label>
+              <input type="password" class="form-control" id="confirm_new_password" name="confirm_new_password" minlength="6" />
+            </div>
+            <button class="btn btn-primary w-100" type="submit">Save Changes</button>
+          </form>
+        </div>
+        """
+        + "{% endblock %}",
+        base_template=base_template,
+        title="Settings",
+        user=user,
+    )
+
+
+@app.route("/chat", methods=["GET", "POST"])
+@login_required
+def chat():
+    user = current_user()
+    if request.method == "POST":
+        content = request.form.get("content", "").strip()
+        if content:
+            msg = Message(content=content, author=user)
+            db.session.add(msg)
+            db.session.commit()
+            flash("Message sent!", "success")
+            return redirect(url_for("chat"))
+
+    messages = Message.query.order_by(Message.id).all()
+    return render_template_string(
+        "{% extends base_template %}{% block content %}"
+        """
+        <h3 class="mb-4">Chat Room</h3>
+        <div style="max-width: 700px; margin: auto;">
+          <div class="border rounded p-3 mb-3" style="height: 350px; overflow-y: auto; background: #e6f2e6;">
+            {% for msg in messages %}
+              {% if msg.author.id == user.id %}
+                <div class="chat-message user">{{ msg.content }}</div>
+              {% else %}
+                <div class="chat-message other"><strong>{{ msg.author.username }}:</strong> {{ msg.content }}</div>
+              {% endif %}
+            {% endfor %}
+          </div>
+          <form method="POST" class="d-flex">
+            <input type="text" name="content" class="form-control me-2" placeholder="Write a message..." required maxlength="500" />
+            <button type="submit" class="btn btn-primary">Send</button>
+          </form>
+        </div>
+        """
+        + "{% endblock %}",
+        base_template=base_template,
+        title="Chat",
+        messages=messages,
+        user=user,
+    )
+
+
+# Run app
 if __name__ == "__main__":
-    app.run(debug=True)
+    # Create tables if not exist (run once)
+    with app.app_context():
+        db.create_all()
+
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=True)
