@@ -1,25 +1,20 @@
+import os
 from flask import (
-    Flask, render_template_string, request, redirect, url_for, session, flash, abort
+    Flask, render_template_string, request, redirect, url_for, session, flash
 )
 from flask_sqlalchemy import SQLAlchemy
 from werkzeug.security import generate_password_hash, check_password_hash
-from urllib import parse as up
-import os
+from sqlalchemy.engine import make_url
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", "dev_secret_key")
 
-# Parse DATABASE_URL env var for PostgreSQL connection, handle missing port
 DATABASE_URL = os.environ.get("DATABASE_URL")
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL environment variable NOT set")
 
-up.uses_netloc.append("postgres")
-url = up.urlparse(DATABASE_URL)
-port = url.port or 5432  # Default postgres port if missing
-app.config[
-    "SQLALCHEMY_DATABASE_URI"
-] = f"postgresql://{url.username}:{url.password}@{url.hostname}:{port}{url.path}"
+db_url = make_url(DATABASE_URL)
+app.config["SQLALCHEMY_DATABASE_URI"] = str(db_url)
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 
 db = SQLAlchemy(app)
@@ -74,7 +69,7 @@ def login_required(f):
     return decorated
 
 
-# Templates (using render_template_string for single-file app)
+# Base template for all pages
 base_template = """
 <!doctype html>
 <html lang="en" data-bs-theme="light">
@@ -180,7 +175,7 @@ base_template = """
 </html>
 """
 
-# ROUTES
+# Routes (same as before, using render_template_string + base_template)
 
 @app.route("/")
 def home():
@@ -501,10 +496,7 @@ def chat():
     )
 
 
-# Run app
 if __name__ == "__main__":
-    # Create tables if not exist (run once)
     with app.app_context():
         db.create_all()
-
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=True)
