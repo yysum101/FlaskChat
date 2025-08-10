@@ -7,11 +7,17 @@ from werkzeug.security import generate_password_hash, check_password_hash
 from sqlalchemy.engine import make_url
 
 app = Flask(__name__)
-app.secret_key = os.environ.get("SECRET_KEY", "dev_secret_key")
+app.secret_key = os.environ.get("SECRET_KEY")
+if not app.secret_key:
+    raise RuntimeError("SECRET_KEY environment variable NOT set")
 
 DATABASE_URL = os.environ.get("DATABASE_URL")
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL environment variable NOT set")
+
+# Fix postgres:// to postgresql:// if needed
+if DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
 db_url = make_url(DATABASE_URL)
 app.config["SQLALCHEMY_DATABASE_URI"] = str(db_url)
@@ -69,7 +75,6 @@ def login_required(f):
     return decorated
 
 
-# Base template for all pages
 base_template = """
 <!doctype html>
 <html lang="en" data-bs-theme="light">
@@ -175,7 +180,9 @@ base_template = """
 </html>
 """
 
-# Routes (same as before, using render_template_string + base_template)
+@app.context_processor
+def inject_user():
+    return dict(current_user=current_user())
 
 @app.route("/")
 def home():
@@ -183,7 +190,6 @@ def home():
         return redirect(url_for("dashboard"))
     else:
         return redirect(url_for("login"))
-
 
 @app.route("/register", methods=["GET", "POST"])
 def register():
@@ -246,7 +252,6 @@ def register():
         title="Register",
     )
 
-
 @app.route("/login", methods=["GET", "POST"])
 def login():
     if current_user():
@@ -289,14 +294,12 @@ def login():
         title="Login",
     )
 
-
 @app.route("/logout")
 @login_required
 def logout():
     session.pop("user_id", None)
     flash("You have been logged out.", "info")
     return redirect(url_for("login"))
-
 
 @app.route("/dashboard", methods=["GET", "POST"])
 @login_required
@@ -354,7 +357,6 @@ def dashboard():
         posts=posts,
     )
 
-
 @app.route("/profile")
 @login_required
 def profile():
@@ -373,7 +375,6 @@ def profile():
         title="Profile",
         user=user,
     )
-
 
 @app.route("/settings", methods=["GET", "POST"])
 @login_required
@@ -468,6 +469,7 @@ def chat():
             return redirect(url_for("chat"))
 
     messages = Message.query.order_by(Message.id).all()
+
     return render_template_string(
         "{% extends base_template %}{% block content %}"
         """
@@ -495,9 +497,9 @@ def chat():
         user=user,
     )
 
+
 if __name__ == "__main__":
     with app.app_context():
         db.create_all()
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=True)
-
-
+    # For Render, gunicorn will start the app, so debug=False here
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=False)
